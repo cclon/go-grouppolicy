@@ -2,8 +2,10 @@ package grouppolicy
 
 import (
 	"encoding/json"
+	"eps/yzlog"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	ps "github.com/ao-com/go-powershell"
@@ -22,12 +24,25 @@ func IsGroupPolicyModuleInstalled() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-
 	return strings.Contains(stdout, "true"), nil
 }
 
+type GPError struct {
+	ErrorId      string // 错误类型
+	CategoryInfo string // 错误明细
+}
+
+func (e GPError) Error() string {
+	return fmt.Sprintf("ErrorId[%s] CategoryInfo[%s]",
+		e.ErrorId,
+		e.CategoryInfo)
+}
+
+var regexpCategoryInfo = regexp.MustCompile(`CategoryInfo[\s]*: (.+)\r`)
+var regexpErrorId = regexp.MustCompile(`FullyQualifiedErrorId : (.+)\r`)
+
 // runLocalPowershell
-func runLocalPowershell(cmd string) (stdout string, stderr string, err error) {
+func runLocalPowershell(cmd string) (string, string, error) {
 
 	back := &backend.Local{}
 	shell, err := ps.New(back)
@@ -36,37 +51,48 @@ func runLocalPowershell(cmd string) (stdout string, stderr string, err error) {
 	}
 	defer shell.Exit()
 
-	fmt.Printf("%s\n", cmd)
+	stdout, stderr, err := shell.Execute(cmd)
 
-	return shell.Execute(cmd)
+	var gpErr GPError
+
+	// 通过正则提出错误信息
+	if err != nil {
+		if msg := regexpCategoryInfo.FindStringSubmatch(stderr); len(msg) == 2 {
+			gpErr.CategoryInfo = msg[1]
+		}
+
+		if msg := regexpErrorId.FindStringSubmatch(stderr); len(msg) == 2 {
+			gpErr.ErrorId = msg[1]
+		}
+
+		if idx := strings.Index(gpErr.CategoryInfo, gpErr.ErrorId); idx != -1 {
+			gpErr.CategoryInfo = gpErr.CategoryInfo[0 : idx-2]
+		}
+
+		err = gpErr
+	}
+
+	return stdout, stderr, err
 }
 
 // NewGPO 新建一个GPO
-func (cli Client) NewGPO(name string, options map[string]interface{}) (*GPO, error) {
+func (cli Client) NewGPO(name, comment, domain string) (*GPO, error) {
 
-	var optionStr string
-	if options != nil {
-		for k, v := range options {
-			switch strings.ToLower(k) {
-			case "comment": // GPO描述
-				optionStr += fmt.Sprintf(` -Comment "%s"`, v)
-			case "domain": // 域名
-				optionStr += fmt.Sprintf(` -Domain "%s"`, v)
-			case "server": // 远端主机
-				optionStr += fmt.Sprintf(` -Server "%s"`, v)
-			case "startergponame":
-				optionStr += fmt.Sprintf(` -StarterName "%s"`, v)
-			case "startergpoguid":
-				optionStr += fmt.Sprintf(` -StarterGpoGuid %s`, v)
-			}
-		}
+	if len(name) == 0 {
+		return nil, errors.New("name could not null")
 	}
 
 	cmd := fmt.Sprintf(`New-GPO "%s"`, name)
-	if len(optionStr) > 0 {
-		cmd += optionStr
+	if len(comment) != 0 {
+		cmd += fmt.Sprintf(` -Comment "%s"`, comment)
 	}
-	cmd += `|  ConvertTo-Json`
+	if len(domain) != 0 {
+		cmd += fmt.Sprintf(` -Domain "%s"`, domain)
+	}
+
+	cmd += ` | ConvertTo-Json`
+
+	yzlog.Debug(cmd)
 
 	stdout, _, err := runLocalPowershell(cmd)
 	if err != nil {
@@ -82,55 +108,47 @@ func (cli Client) NewGPO(name string, options map[string]interface{}) (*GPO, err
 }
 
 // RemoveGPO 删除一个GPO
-func (cli Client) RemoveGPO(options map[string]interface{}) error {
+// 可以通过name或者GUID进行删除，如果都为空，返回错误，如果都指定，则使用guid，忽略name
+func (cli Client) RemoveGPO(name, guid, domain string, keeplinks bool) error {
 
-	var optionStr string
-	if options != nil {
-
-		for k, v := range options {
-			switch strings.ToLower(k) {
-			case "server":
-				optionStr += fmt.Sprintf(` -Server "%s"`, v)
-			case "guid":
-				optionStr += fmt.Sprintf(` -Guid "%s"`, v)
-			case "name":
-				optionStr += fmt.Sprintf(` -Name "%s"`, v)
-			case "domain":
-				optionStr += fmt.Sprintf(` -Domain "%s"`, v)
-			case "keeplinks":
-				optionStr += " -KeepLinks"
-			}
-		}
+	cmd := `remove-gpo`
+	if len(name) == 0 && len(guid) == 0 {
+		return errors.New("you must point one of name or guid")
 	}
 
-	cmd := fmt.Sprintf(`Remove-GPO %s`, optionStr)
-	_, _, err := runLocalPowershell(cmd)
-	return err
+	if len(guid) != 0 {
+		cmd += fmt.Sprintf(` -guid "%s"`, guid)
+	} else if len(name) != 0 {
+		cmd += fmt.Sprintf(` "%s"`, name)
+	}
+
+	if len(domain) != 0 {
+		cmd += fmt.Sprintf(` -domain "%s"`, domain)
+	}
+
+	if keeplinks {
+		cmd += ` -keeplinks`
+	}
+
+	yzlog.Debug(cmd)
+	//_, _, err := runLocalPowershell(cmd)
+	return nil
 }
 
-//
-func (cli Client) GetAllGPO(optionals map[string]interface{}) (gpos []*GPO, err error) {
+// GetAllGPO 返回所有GPO列表
+func (cli Client) GetAllGPO(domain string) (gpos []*GPO, err error) {
 
-	var optionalStr string
 	cmd := `Get-GPO -All`
-
-	if optionals != nil {
-		for k, v := range optionals {
-			switch strings.ToLower(k) {
-			case "server":
-				optionalStr += fmt.Sprintf(` -Server "%s"`, v)
-			case "domain":
-				optionalStr += fmt.Sprintf(` -Domain "%s"`, v)
-			}
-		}
-	}
-
-	if len(optionalStr) > 0 {
-		cmd += optionalStr
+	if len(domain) != 0 {
+		cmd += fmt.Sprintf(` -Domain "%s"`, domain)
 	}
 
 	cmd += ` | ConvertTo-Json`
-	stdout, _, err := runLocalPowershell(cmd)
+
+	yzlog.Debug(cmd)
+
+	stdout, stderr, err := runLocalPowershell(cmd)
+	_ = stderr
 	if err != nil {
 		return nil, err
 	}
@@ -144,26 +162,22 @@ func (cli Client) GetAllGPO(optionals map[string]interface{}) (gpos []*GPO, err 
 }
 
 // 返回指定参数条件的GPO列表
-// options may have some options:
-// Guid/Name/Domain/Server,All
+// 可以通过name或者GUID进行查询GPO信息，如果都为空，返回错误，如果都指定，则使用guid，忽略name
 // you can see how to use from http://go.microsoft.com/fwlink/?LinkId=216700
-func (cli Client) GetGPO(nameOrGuid string, optionals map[string]interface{}) (*GPO, error) {
+func (cli Client) GetGPO(name, guid, domain string) (*GPO, error) {
 
-	var optionalStr string
-	if optionals != nil {
-		for k, v := range optionals {
-			switch strings.ToLower(k) {
-			case "server":
-				optionalStr += fmt.Sprintf(` -Server "%s"`, v)
-			case "domain":
-				optionalStr += fmt.Sprintf(` -Domain "%s"`, v)
-			}
-		}
+	if len(name) == 0 && len(guid) == 0 {
+		return nil, errors.New("you must point one of name or guid")
+	}
+	cmd := `Get-GPO`
+	if len(guid) != 0 {
+		cmd += fmt.Sprintf(` "%s"`, guid)
+	} else {
+		cmd += fmt.Sprintf(` "%s"`, name)
 	}
 
-	cmd := fmt.Sprintf(`Get-GPO %s`, nameOrGuid)
-	if len(optionalStr) > 0 {
-		cmd += optionalStr
+	if len(domain) != 0 {
+		cmd += fmt.Sprintf(` -Domain "%s"`, domain)
 	}
 
 	cmd += ` | ConvertTo-Json`
@@ -193,50 +207,68 @@ func (cli Client) SetGPLink() error {
 	return errors.New("unknown")
 }
 
-// NewGPLink 链接一个GPO到站点(site)，域名(Domain)或者组织单位(OU)
-func (cli Client) NewGPLink(srcGpoOption map[string]interface{}, target string) error {
+type PSBoolean string
 
-	srcGpoOptionStr := ""
-	if srcGpoOption != nil {
-		for k, v := range srcGpoOption {
-			switch strings.ToLower(k) {
-			case "server":
-				srcGpoOptionStr += fmt.Sprintf(` -Server "%s"`, v)
-			case "guid":
-				srcGpoOptionStr += fmt.Sprintf(` -Name "%s"`, v)
-			case "name":
-				srcGpoOptionStr += fmt.Sprintf(` -Guid "%s"`, v)
-			case "domain":
-				srcGpoOptionStr += fmt.Sprintf(` -Domain "%s"`, v)
-			}
-		}
+const (
+	Unspecified PSBoolean = "Unspecified"
+	No          PSBoolean = "No"
+	Yes         PSBoolean = "Yes"
+)
+
+// NewGPLink 链接一个GPO到站点(site)，域名(Domain)或者组织单位(OU)
+func (cli Client) NewGPLink(name,
+	target,
+	domain string,
+	enforced, linkEnabled PSBoolean) error {
+
+	if len(name) == 0 {
+		return errors.New("you must point a name")
 	}
 
-	cmd := fmt.Sprintf(`New-GPLink %s -Target "%s"`, srcGpoOptionStr, target)
+	if len(target) == 0 {
+		return errors.New("you must set GPLink target")
+	}
+
+	cmd := fmt.Sprintf(`New-GPLink "%s"  -Target "%s"`, name, target)
+
+	if len(domain) != 0 {
+		cmd += fmt.Sprintf(` -Domain "%s"`, domain)
+	}
+	if len(enforced) != 0 {
+		cmd += fmt.Sprintf(` -Enforced "%s"`, enforced)
+	}
+	if len(linkEnabled) != 0 {
+		cmd += fmt.Sprintf(` -LinkEnabled "%s"`, linkEnabled)
+	}
+
 	_, _, err := runLocalPowershell(cmd)
 	return err
 }
 
 // RemoveGPLink 删除一个GPO链接
-func (cli Client) RemoveGPLink(srcGpoOption map[string]interface{}, target string) error {
+func (cli Client) RemoveGPLink(name, guid, target, domain string) error {
 
-	optionStr := ""
-	if srcGpoOption != nil {
-		for k, v := range srcGpoOption {
-			switch strings.ToLower(k) {
-			case "server":
-				optionStr += fmt.Sprintf(` -Server "%s"`, v)
-			case "guid":
-				optionStr += fmt.Sprintf(` -Name "%s"`, v)
-			case "name":
-				optionStr += fmt.Sprintf(` -Guid "%s"`, v)
-			case "domain":
-				optionStr += fmt.Sprintf(` -Domain "%s"`, v)
-			}
-		}
+	if len(name) == 0 && len(guid) == 0 {
+		return errors.New("you must point one of name or guid")
+	}
+	if len(target) == 0 {
+		return errors.New("you must set Remove-GPLink target")
 	}
 
-	cmd := fmt.Sprintf(`Remove-GPLink %s -Target "%s"`, optionStr, target)
+	cmd := `Remove-GPLink`
+	if len(guid) != 0 {
+		cmd += fmt.Sprintf(` -Guid "%s"`, guid)
+	} else {
+		cmd += fmt.Sprintf(` "%s"`, name)
+	}
+
+	if len(domain) != 0 {
+		cmd += fmt.Sprintf(` -Domain "%s"`, domain)
+	}
+	cmd += fmt.Sprintf(` -Target "%s"`, target)
+
+	yzlog.Debug(cmd)
+
 	_, _, err := runLocalPowershell(cmd)
 	return err
 }
