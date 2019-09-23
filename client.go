@@ -230,9 +230,14 @@ func (cli Client) GetGPO(name, guid, domain string) (*GPO, error) {
 	return gpo, nil
 }
 
-// SetGPLink 设置GPO链接的属性
-func (cli Client) SetGPLink() error {
-	return errors.New("unknown")
+// SetGPLink 设置GPO链接的属性(和New-GPLink参数一致)
+func (cli Client) SetGPLink(name,
+	target,
+	domain string,
+	enforced,
+	linkEnabled PSBoolean) error {
+
+	return cli.NewGPLink(name, target, domain, enforced, linkEnabled)
 }
 
 // NewGPLink 链接一个GPO到站点(site)，域名(Domain)或者组织单位(OU)
@@ -324,6 +329,7 @@ func (cli Client) BackupGPO(name, guid, path, comment string) error {
 }
 
 // ImportGPO 导入GPO配置，并覆盖已经存在GPO
+// 注意： 目标GPO必须存在
 func (cli Client) ImportGPO(backupGpoName, targetName, path string) error {
 
 	if len(backupGpoName) == 0 || len(targetName) == 0 || len(path) == 0 {
